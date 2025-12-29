@@ -23,7 +23,7 @@ const firebaseConfig = {
   projectId: "bridgelink-4c01a",
   storageBucket: "bridgelink-4c01a.firebasestorage.app",
   messagingSenderId: "148504358430",
-  appId: "1:148504358430:web:6e836f1ef867bd3e57480f",
+  appId: "1:148504358430:web:6e836f1ef867bd3e57480f", 
 };
 
 // 你可以自定义应用ID，用于区分数据库中的数据路径
@@ -44,7 +44,8 @@ const rtcConfig = {
   ],
 };
 
-const CHUNK_SIZE = 16 * 1024; // 16KB chunks
+// 降低分片大小以适应移动端不稳定的上行带宽
+const CHUNK_SIZE = 8 * 1024; 
 const COLLECTION_NAME = 'rooms'; 
 
 // --- 提取 Header 组件到外部，避免 React 渲染错误 ---
@@ -79,8 +80,8 @@ export default function App() {
   const receivedSize = useRef(0);
   const currentFileMeta = useRef(null);
   const processedCandidates = useRef(new Set()); 
-  const heartbeatInterval = useRef(null); // 用于保持 NAT 连接的心跳定时器
-  const isSettingRemoteAnswer = useRef(false); // 防止重复设置 Answer 导致报错
+  const heartbeatInterval = useRef(null); 
+  const isSettingRemoteAnswer = useRef(false); 
 
   // --- Auth & URL Params ---
   useEffect(() => {
@@ -143,7 +144,6 @@ export default function App() {
         setShowQR(false); 
       } else if (peerConnection.current.connectionState === 'disconnected' || peerConnection.current.connectionState === 'failed') {
         setConnectionStatus('disconnected');
-        // 关键修复：移除 alert 弹窗，改为系统消息，防止阻塞
         addSystemMessage("连接已断开");
         if (heartbeatInterval.current) clearInterval(heartbeatInterval.current);
       }
@@ -176,17 +176,8 @@ export default function App() {
       addSystemMessage("P2P 通道已建立！可以开始传输。");
       setShowQR(false); 
 
-      // 关键修复：启动心跳机制，每2秒发送一次 ping，防止移动端 NAT 关闭端口
-      if (heartbeatInterval.current) clearInterval(heartbeatInterval.current);
-      heartbeatInterval.current = setInterval(() => {
-        if (dataChannel.current && dataChannel.current.readyState === 'open') {
-          try {
-             dataChannel.current.send(JSON.stringify({ type: 'ping' }));
-          } catch (e) {
-             console.error("Heartbeat failed", e);
-          }
-        }
-      }, 2000);
+      // 启动心跳机制
+      startHeartbeat();
     };
 
     dataChannel.current.onclose = () => {
@@ -197,12 +188,26 @@ export default function App() {
     dataChannel.current.onmessage = handleDataChannelMessage;
   };
 
+  const startHeartbeat = () => {
+    if (heartbeatInterval.current) clearInterval(heartbeatInterval.current);
+    heartbeatInterval.current = setInterval(() => {
+      // 只有在空闲（没有正在发送大文件）时才发送心跳，避免抢占带宽
+      if (dataChannel.current && dataChannel.current.readyState === 'open' && !isSending) {
+        try {
+           dataChannel.current.send(JSON.stringify({ type: 'ping' }));
+        } catch (e) {
+           // 忽略心跳发送失败
+        }
+      }
+    }, 2000);
+  };
+
   const handleDataChannelMessage = (event) => {
     const data = event.data;
     if (typeof data === 'string') {
       try {
         const msg = JSON.parse(data);
-        if (msg.type === 'ping') return; // 忽略心跳包
+        if (msg.type === 'ping') return; 
 
         if (msg.type === 'text') {
           setMessages(prev => [...prev, { sender: 'peer', text: msg.content, time: new Date() }]);
@@ -266,7 +271,6 @@ export default function App() {
       const data = snapshot.data();
       if (!data) return;
 
-      // 修复 InvalidStateError: 只有在等待应答时才设置 Answer，且防止重复设置
       if (peerConnection.current.signalingState === 'have-local-offer' && data.answer && !isSettingRemoteAnswer.current) {
         isSettingRemoteAnswer.current = true;
         try {
@@ -337,15 +341,34 @@ export default function App() {
 
   const sendMessage = () => {
     if (!inputMsg.trim() || !dataChannel.current) return;
+    // 增加状态检查，防止未连接时发送导致报错/卡顿
+    if (dataChannel.current.readyState !== 'open') {
+        alert("连接尚未完全建立，请稍候...");
+        return;
+    }
+
     const msg = { type: 'text', content: inputMsg };
-    dataChannel.current.send(JSON.stringify(msg));
-    setMessages(prev => [...prev, { sender: 'me', text: inputMsg, time: new Date() }]);
-    setInputMsg('');
+    try {
+        dataChannel.current.send(JSON.stringify(msg));
+        setMessages(prev => [...prev, { sender: 'me', text: inputMsg, time: new Date() }]);
+        setInputMsg('');
+    } catch (e) {
+        console.error("Send failed", e);
+        alert("发送失败，请重试");
+    }
   };
 
   const sendFile = async (file) => {
     if (!dataChannel.current || isSending) return;
+    if (dataChannel.current.readyState !== 'open') {
+        alert("连接未就绪");
+        return;
+    }
+    
     setIsSending(true);
+
+    // 发送文件时，暂停心跳，避免抢占带宽
+    if (heartbeatInterval.current) clearInterval(heartbeatInterval.current);
 
     const meta = { type: 'file-meta', name: file.name, size: file.size, fileType: file.type };
     dataChannel.current.send(JSON.stringify(meta));
@@ -354,15 +377,26 @@ export default function App() {
     let offset = 0;
 
     reader.onload = async (e) => {
-      if (!dataChannel.current) return;
-
-      // 修复传输卡死：添加背压控制 (Backpressure Check)
-      // 如果缓冲区积压超过 64KB，暂停读取，等待缓冲区清空
-      while (dataChannel.current.bufferedAmount > 64 * 1024) {
-        await new Promise(resolve => setTimeout(resolve, 50));
+      if (!dataChannel.current || dataChannel.current.readyState !== 'open') {
+          setIsSending(false);
+          startHeartbeat(); // 恢复心跳
+          return;
       }
 
-      dataChannel.current.send(e.target.result);
+      // 优化流控：降低水位线到 16KB，适应移动端慢速网络
+      while (dataChannel.current.bufferedAmount > 16 * 1024) {
+        await new Promise(resolve => setTimeout(resolve, 20)); // 短暂休眠
+      }
+
+      try {
+        dataChannel.current.send(e.target.result);
+      } catch (err) {
+        console.error("Chunk send failed", err);
+        setIsSending(false);
+        startHeartbeat();
+        return;
+      }
+      
       offset += e.target.result.byteLength;
 
       const progress = Math.min(100, Math.round((offset / file.size) * 100));
@@ -376,6 +410,7 @@ export default function App() {
         addSystemMessage(`文件发送完成: ${file.name}`);
         setIsSending(false);
         setTransferProgress(0);
+        startHeartbeat(); // 传输完成，恢复心跳
       }
     };
 
@@ -507,7 +542,6 @@ export default function App() {
                 <p className="text-2xl font-mono font-bold tracking-wider text-slate-800">{roomId}</p>
               </div>
               <div className="flex items-center gap-2">
-                 {/* 优化状态指示器渲染，合并 className，修复编译错误 */}
                  <div className={`flex items-center gap-1 text-sm font-medium px-2 py-1 rounded transition-colors duration-300 ${connectionStatus === 'connected' ? "bg-emerald-50 text-emerald-600" : "bg-amber-50 text-amber-600"}`}>
                     {connectionStatus === 'connected' ? <CheckCircle size={14} /> : <Loader size={14} className="animate-spin" />}
                     <span className="hidden sm:inline">{connectionStatus === 'connected' ? '已连接' : '连接中...'}</span>
@@ -526,7 +560,6 @@ export default function App() {
                  </button>
               </div>
 
-              {/* 使用 CSS 隐藏而不是 React 条件渲染，防止 DOM 节点丢失导致的崩溃 */}
               <div className={`absolute top-full left-0 right-0 mt-2 z-20 flex flex-col items-center bg-white p-4 rounded-xl shadow-xl border border-slate-200 transition-all duration-300 origin-top ${showQR ? 'opacity-100 scale-100 visible' : 'opacity-0 scale-95 invisible pointer-events-none'}`}>
                   <div className="bg-white p-2 rounded-lg">
                     <img 
