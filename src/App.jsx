@@ -12,7 +12,7 @@ import {
 
 /**
  * BridgeLink - Robust Cross-Subnet File Transfer
- * Fixed: File transfer deadlocks, mobile latency, and connection jitter.
+ * Fixed: InvalidStateError (Race Condition), ICE Candidate flooding, and Mobile stability.
  */
 
 // --- Firebase Configuration ---
@@ -32,7 +32,7 @@ const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 
-// RTC Configuration: Optimized for China
+// RTC Configuration
 const rtcConfig = {
   iceServers: [
     { urls: 'stun:stun.miwifi.com' },
@@ -43,9 +43,8 @@ const rtcConfig = {
   iceCandidatePoolSize: 10,
 };
 
-// WebRTC 最佳实践：16KB 分片，既不过大导致丢包，也不过小导致 CPU 飙升
 const CHUNK_SIZE = 16384; 
-const BUFFER_THRESHOLD = 65536; // 64KB 高水位线
+const BUFFER_THRESHOLD = 65536; 
 const COLLECTION_NAME = 'rooms'; 
 
 const Header = ({ connectionStatus, setView }) => (
@@ -83,7 +82,9 @@ export default function App() {
   const receivedSize = useRef(0);
   const currentFileMeta = useRef(null);
   const heartbeatInterval = useRef(null);
-  const disconnectTimer = useRef(null); // 用于防抖动断连
+  const disconnectTimer = useRef(null); 
+  const processedCandidates = useRef(new Set()); // 用于 ICE 候选去重
+  const signalingLock = useRef(false); // 关键修复：防止信令竞态条件
 
   // --- Auth & Init ---
   useEffect(() => {
@@ -113,6 +114,8 @@ export default function App() {
     if (peerConnection.current) peerConnection.current.close();
     peerConnection.current = null;
     dataChannel.current = null;
+    processedCandidates.current.clear();
+    signalingLock.current = false;
   };
 
   // --- WebRTC Core ---
@@ -128,7 +131,7 @@ export default function App() {
         const roomRef = doc(db, 'artifacts', appId, 'public', 'data', COLLECTION_NAME, activeRoomId);
         try {
           await updateDoc(roomRef, { [field]: arrayUnion(event.candidate.toJSON()) });
-        } catch (e) { /* ignore auth errors on tear down */ }
+        } catch (e) { /* ignore */ }
       }
     };
 
@@ -141,10 +144,10 @@ export default function App() {
         setConnectionStatus('connected');
         setShowQR(false);
       } else if (state === 'disconnected' || state === 'failed') {
-        // 防抖动：延迟 3 秒显示断开，给网络抖动留出恢复时间
         if (disconnectTimer.current) clearTimeout(disconnectTimer.current);
         disconnectTimer.current = setTimeout(() => {
           setConnectionStatus('disconnected');
+          // 只有在真正断开一段时间后才提示，忽略短暂的网络抖动
           addSystemMessage("连接已断开，正在尝试恢复...");
         }, 3000);
       }
@@ -167,7 +170,6 @@ export default function App() {
 
   const setupDataChannel = (dc) => {
     dataChannel.current = dc;
-    // 设置缓冲阈值，配合 sendFile 使用
     dc.bufferedAmountLowThreshold = CHUNK_SIZE;
 
     dc.onopen = () => {
@@ -188,7 +190,6 @@ export default function App() {
   const startHeartbeat = () => {
     if (heartbeatInterval.current) clearInterval(heartbeatInterval.current);
     heartbeatInterval.current = setInterval(() => {
-      // 只有在空闲时发送心跳，防止阻塞文件流
       if (dataChannel.current?.readyState === 'open' && dataChannel.current.bufferedAmount === 0) {
         try { dataChannel.current.send(JSON.stringify({ type: 'ping' })); } catch(e){}
       }
@@ -214,7 +215,6 @@ export default function App() {
         }
       } catch (e) {}
     } else {
-      // 接收二进制分片
       receivedBuffers.current.push(data);
       receivedSize.current += data.byteLength;
       if (currentFileMeta.current) {
@@ -253,15 +253,26 @@ export default function App() {
       const d = s.data();
       if (!d) return;
       
-      // Handle Answer
-      if (peerConnection.current?.signalingState === 'have-local-offer' && d.answer) {
-        await peerConnection.current.setRemoteDescription(new RTCSessionDescription(d.answer));
+      // 关键修复：使用 signalingLock 防止重复设置 Answer 导致的 InvalidStateError
+      if (!signalingLock.current && peerConnection.current?.signalingState === 'have-local-offer' && d.answer) {
+        signalingLock.current = true;
+        try {
+          await peerConnection.current.setRemoteDescription(new RTCSessionDescription(d.answer));
+        } catch (e) {
+          console.error("Set Remote Desc Error:", e);
+        } finally {
+          signalingLock.current = false;
+        }
       }
       
-      // Handle Candidates
+      // 关键修复：使用 processedCandidates 防止重复添加 ICE 候选
       if (d.calleeCandidates) {
         d.calleeCandidates.forEach(async c => {
-           try { await peerConnection.current.addIceCandidate(new RTCIceCandidate(c)); } catch(e){}
+           const cString = JSON.stringify(c);
+           if (!processedCandidates.current.has(cString)) {
+             processedCandidates.current.add(cString);
+             try { await peerConnection.current.addIceCandidate(new RTCIceCandidate(c)); } catch(e){}
+           }
         });
       }
     });
@@ -289,9 +300,14 @@ export default function App() {
 
       onSnapshot(roomRef, (s) => {
         const d = s.data();
+        // 关键修复：同样在接收端应用 ICE 去重
         if (d?.callerCandidates) {
           d.callerCandidates.forEach(async c => {
-             try { await peerConnection.current.addIceCandidate(new RTCIceCandidate(c)); } catch(e){}
+             const cString = JSON.stringify(c);
+             if (!processedCandidates.current.has(cString)) {
+               processedCandidates.current.add(cString);
+               try { await peerConnection.current.addIceCandidate(new RTCIceCandidate(c)); } catch(e){}
+             }
           });
         }
       });
@@ -315,10 +331,6 @@ export default function App() {
     setInputMsg('');
   };
 
-  /**
-   * 核心修复：高性能文件发送逻辑
-   * 使用递归 + bufferedAmountLow 事件，彻底解决卡顿和死锁问题
-   */
   const sendFile = async (file) => {
     if (!dataChannel.current || isSending) return;
     const dc = dataChannel.current;
@@ -326,7 +338,6 @@ export default function App() {
 
     setIsSending(true);
     
-    // 1. 发送元数据
     dc.send(JSON.stringify({ type: 'file-meta', name: file.name, size: file.size, fileType: file.type }));
 
     const reader = new FileReader();
@@ -346,18 +357,15 @@ export default function App() {
         setTransferProgress(Math.min(100, Math.round((offset / file.size) * 100)));
 
         if (offset < file.size) {
-          // 流控核心：如果缓冲区满了，等待 bufferedamountlow 事件再继续
           if (dc.bufferedAmount > BUFFER_THRESHOLD) {
             dc.onbufferedamountlow = () => {
-              dc.onbufferedamountlow = null; // 清除监听，防止泄漏
+              dc.onbufferedamountlow = null; 
               readNextChunk();
             };
           } else {
-            // 缓冲区未满，直接读下一块
             readNextChunk();
           }
         } else {
-          // 发送完成
           dc.send(JSON.stringify({ type: 'file-end' }));
           setFiles(p => [...p, { name: file.name, size: file.size, sender: 'me' }]);
           addSystemMessage(`文件发送完成: ${file.name}`);
