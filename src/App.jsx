@@ -4,10 +4,10 @@ import {
   getFirestore, collection, doc, setDoc, onSnapshot, updateDoc, 
   addDoc, getDoc, deleteDoc, arrayUnion 
 } from 'firebase/firestore';
-import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
 import { 
   Wifi, Send, Download, Copy, Smartphone, Monitor, CheckCircle, 
-  XCircle, FileText, Loader, ArrowRight, Link as LinkIcon, QrCode 
+  FileText, Loader, Link as LinkIcon, QrCode 
 } from 'lucide-react';
 
 /**
@@ -17,59 +17,73 @@ import {
 
 // --- Firebase Configuration & Initialization ---
 // ⚠️ 必须修改：请替换为你自己的 Firebase 项目配置
-// 你可以在 Firebase Console -> Project Settings -> General -> Your apps 中找到
 const firebaseConfig = {
-   apiKey: "AIzaSyD4CjObcCBweNd_iV5zXO9WHUCYqgFhyJk",
+  apiKey: "AIzaSyD4CjObcCBweNd_iV5zXO9WHUCYqgFhyJk",
   authDomain: "bridgelink-4c01a.firebaseapp.com",
   projectId: "bridgelink-4c01a",
   storageBucket: "bridgelink-4c01a.firebasestorage.app",
   messagingSenderId: "148504358430",
-  appId: "1:148504358430:web:6e836f1ef867bd3e57480f"
+  appId: "1:148504358430:web:6e836f1ef867bd3e57480f",
 };
 
 // 你可以自定义应用ID，用于区分数据库中的数据路径
 const appId = 'bridge-link-v1';
 
+// Initialize Firebase
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 
-// RTC Configuration (Google's free STUN servers help penetrate NAT)
+// RTC Configuration
 const rtcConfig = {
   iceServers: [
-    { urls: ['stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302'] },
+    { urls: 'stun:stun.miwifi.com' },
+    { urls: 'stun:stun.qq.com' },
+    { urls: 'stun:global.stun.twilio.com:3478' },
+    { urls: 'stun:stun.l.google.com:19302' }
   ],
 };
 
-const CHUNK_SIZE = 16 * 1024; // 16KB chunks for safe reliable transfer
-const COLLECTION_NAME = 'rooms'; // Specific collection for rooms
+const CHUNK_SIZE = 16 * 1024; // 16KB chunks
+const COLLECTION_NAME = 'rooms'; 
+
+// --- 提取 Header 组件到外部，避免 React 渲染错误 ---
+const Header = ({ connectionStatus, setView }) => (
+  <div className="bg-indigo-600 text-white p-4 shadow-md flex justify-between items-center z-10 relative">
+    <div className="flex items-center gap-2" onClick={() => setView('home')}>
+      <Wifi className="w-6 h-6 cursor-pointer" />
+      <h1 className="text-xl font-bold cursor-pointer">BridgeLink</h1>
+    </div>
+    <div className="text-xs bg-indigo-700 px-2 py-1 rounded">
+      {connectionStatus === 'connected' ? 'P2P 已加密连接' : '等待连接...'}
+    </div>
+  </div>
+);
 
 export default function App() {
   const [user, setUser] = useState(null);
-  const [view, setView] = useState('home'); // home, host, join, session
+  const [view, setView] = useState('home'); 
   const [roomId, setRoomId] = useState('');
-  const [connectionStatus, setConnectionStatus] = useState('disconnected'); // disconnected, connecting, connected
+  const [connectionStatus, setConnectionStatus] = useState('disconnected'); 
   const [messages, setMessages] = useState([]);
   const [files, setFiles] = useState([]);
   const [inputMsg, setInputMsg] = useState('');
   const [transferProgress, setTransferProgress] = useState(0);
   const [isSending, setIsSending] = useState(false);
-  const [showQR, setShowQR] = useState(false); // Toggle QR code visibility
+  const [showQR, setShowQR] = useState(false);
 
-  // Refs for WebRTC and File Handling
+  // Refs
   const peerConnection = useRef(null);
   const dataChannel = useRef(null);
-  const fileReader = useRef(null);
   const receivedBuffers = useRef([]);
   const receivedSize = useRef(0);
   const currentFileMeta = useRef(null);
-  const processedCandidates = useRef(new Set()); // To avoid re-adding candidates
+  const processedCandidates = useRef(new Set()); 
 
   // --- Auth & URL Params ---
   useEffect(() => {
     const initAuth = async () => {
       try {
-        // 在真实部署环境中，通常直接使用匿名登录即可
         await signInAnonymously(auth);
       } catch (error) {
         console.error("Auth Error:", error);
@@ -79,7 +93,6 @@ export default function App() {
     
     const unsubscribe = onAuthStateChanged(auth, (u) => setUser(u));
 
-    // Check for URL parameters (e.g., ?room=ABCDEF) to auto-fill join code
     const params = new URLSearchParams(window.location.search);
     const roomParam = params.get('room');
     if (roomParam) {
@@ -92,17 +105,19 @@ export default function App() {
 
   // --- WebRTC Logic ---
 
-  // Pass activeRoomId explicitly to avoid closure staleness issues with state
   const setupPeerConnection = async (isInitiator, activeRoomId) => {
+    // 每次新建连接前先清理旧的，防止内存泄漏或状态冲突
+    if (peerConnection.current) {
+        peerConnection.current.close();
+    }
+      
     peerConnection.current = new RTCPeerConnection(rtcConfig);
     processedCandidates.current.clear();
 
-    // ICE Candidates: Send to Firestore via arrayUnion to main doc
     peerConnection.current.onicecandidate = async (event) => {
       if (event.candidate && auth.currentUser) {
         const candidateField = isInitiator ? 'callerCandidates' : 'calleeCandidates';
         const roomRef = doc(db, 'artifacts', appId, 'public', 'data', COLLECTION_NAME, activeRoomId);
-        // Use arrayUnion to add to the array in the main document safely
         try {
           await updateDoc(roomRef, {
             [candidateField]: arrayUnion(event.candidate.toJSON())
@@ -120,27 +135,24 @@ export default function App() {
         setShowQR(false); 
       } else if (peerConnection.current.connectionState === 'disconnected' || peerConnection.current.connectionState === 'failed') {
         setConnectionStatus('disconnected');
+        // 不要立即重置视图，给用户一点反应时间，或者允许重连
         alert("连接已断开");
-        setView('home');
+        // setView('home'); 
       }
     };
 
     if (isInitiator) {
-      // Create Data Channel (Host side)
       dataChannel.current = peerConnection.current.createDataChannel("chat");
       setupDataChannel();
       
-      // Create Offer
       const offer = await peerConnection.current.createOffer();
       await peerConnection.current.setLocalDescription(offer);
 
-      // Save Offer to Firestore (Update existing doc created in createRoom)
       if (auth.currentUser) {
         const roomRef = doc(db, 'artifacts', appId, 'public', 'data', COLLECTION_NAME, activeRoomId);
         await updateDoc(roomRef, { offer: { type: offer.type, sdp: offer.sdp } });
       }
     } else {
-      // Joiner waits for Data Channel
       peerConnection.current.ondatachannel = (event) => {
         dataChannel.current = event.channel;
         setupDataChannel();
@@ -154,7 +166,7 @@ export default function App() {
     dataChannel.current.onopen = () => {
       setConnectionStatus('connected');
       addSystemMessage("P2P 通道已建立！可以开始传输。");
-      setShowQR(false); // Hide QR code on connection
+      setShowQR(false); 
     };
 
     dataChannel.current.onmessage = handleDataChannelMessage;
@@ -162,8 +174,6 @@ export default function App() {
 
   const handleDataChannelMessage = (event) => {
     const data = event.data;
-
-    // If string, it's a JSON message (chat or metadata)
     if (typeof data === 'string') {
       const msg = JSON.parse(data);
       if (msg.type === 'text') {
@@ -177,9 +187,7 @@ export default function App() {
       } else if (msg.type === 'file-end') {
         saveReceivedFile();
       }
-    } 
-    // If ArrayBuffer, it's a file chunk
-    else {
+    } else {
       receivedBuffers.current.push(data);
       receivedSize.current += data.byteLength;
       
@@ -198,7 +206,6 @@ export default function App() {
     setFiles(prev => [...prev, { name: meta.name, size: meta.size, url, sender: 'peer' }]);
     addSystemMessage(`文件接收完成: ${meta.name}`);
     
-    // Reset
     receivedBuffers.current = [];
     receivedSize.current = 0;
     currentFileMeta.current = null;
@@ -213,9 +220,8 @@ export default function App() {
     setRoomId(generatedId);
     setView('session');
     setConnectionStatus('connecting');
-    setShowQR(true); // Auto show QR for host
+    setShowQR(true); 
 
-    // 1. Initialize Document FIRST to ensure it exists before candidates are added
     const roomRef = doc(db, 'artifacts', appId, 'public', 'data', COLLECTION_NAME, generatedId);
     await setDoc(roomRef, { 
       created: Date.now(),
@@ -223,24 +229,19 @@ export default function App() {
       calleeCandidates: []
     });
 
-    // 2. Start WebRTC (Will trigger candidate gathering -> updateDoc)
     await setupPeerConnection(true, generatedId);
 
-    // 3. Listen for changes (Answer & Remote Candidates)
     onSnapshot(roomRef, (snapshot) => {
       const data = snapshot.data();
       if (!data) return;
 
-      // Check Answer
       if (!peerConnection.current.currentRemoteDescription && data.answer) {
         const answer = new RTCSessionDescription(data.answer);
         peerConnection.current.setRemoteDescription(answer);
       }
 
-      // Check Remote Candidates (Callee's candidates)
       if (data.calleeCandidates && Array.isArray(data.calleeCandidates)) {
         data.calleeCandidates.forEach(async (c) => {
-           // Simple duplicate check using candidate string
            const candidateStr = JSON.stringify(c);
            if (!processedCandidates.current.has(candidateStr)) {
              processedCandidates.current.add(candidateStr);
@@ -265,18 +266,16 @@ export default function App() {
       
       const data = roomSnapshot.data();
 
-      // Set Remote Description (Offer)
-      const offer = data.offer;
-      await peerConnection.current.setRemoteDescription(new RTCSessionDescription(offer));
+      if(data.offer) {
+          const offer = data.offer;
+          await peerConnection.current.setRemoteDescription(new RTCSessionDescription(offer));
+    
+          const answer = await peerConnection.current.createAnswer();
+          await peerConnection.current.setLocalDescription(answer);
+    
+          await updateDoc(roomRef, { answer: { type: answer.type, sdp: answer.sdp } });
+      }
 
-      // Create Answer
-      const answer = await peerConnection.current.createAnswer();
-      await peerConnection.current.setLocalDescription(answer);
-
-      // Save Answer to Firestore
-      await updateDoc(roomRef, { answer: { type: answer.type, sdp: answer.sdp } });
-
-      // Listen for Remote Candidates (Caller's candidates) - Now in main doc
       onSnapshot(roomRef, (snapshot) => {
         const newData = snapshot.data();
         if (!newData) return;
@@ -297,8 +296,6 @@ export default function App() {
     }
   };
 
-  // --- Interaction Logic ---
-
   const sendMessage = () => {
     if (!inputMsg.trim() || !dataChannel.current) return;
     const msg = { type: 'text', content: inputMsg };
@@ -311,11 +308,9 @@ export default function App() {
     if (!dataChannel.current || isSending) return;
     setIsSending(true);
 
-    // 1. Send Metadata
     const meta = { type: 'file-meta', name: file.name, size: file.size, fileType: file.type };
     dataChannel.current.send(JSON.stringify(meta));
     
-    // 2. Read and Send Chunks
     const reader = new FileReader();
     let offset = 0;
 
@@ -324,14 +319,12 @@ export default function App() {
       dataChannel.current.send(e.target.result);
       offset += e.target.result.byteLength;
 
-      // Update local progress
       const progress = Math.min(100, Math.round((offset / file.size) * 100));
       setTransferProgress(progress);
 
       if (offset < file.size) {
         readSlice(offset);
       } else {
-        // 3. Send End Signal
         dataChannel.current.send(JSON.stringify({ type: 'file-end' }));
         setFiles(prev => [...prev, { name: file.name, size: file.size, sender: 'me' }]);
         addSystemMessage(`文件发送完成: ${file.name}`);
@@ -360,18 +353,16 @@ export default function App() {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
   };
 
-  // Helper to generate current page URL with room ID
   const getJoinUrl = () => {
     const url = new URL(window.location.href);
     url.searchParams.set('room', roomId);
     return url.toString();
   };
 
-  // Helper for clipboard copy compatible with iframe
   const copyToClipboard = (text) => {
     const textArea = document.createElement("textarea");
     textArea.value = text;
-    textArea.style.position = "fixed"; // Avoid scrolling to bottom
+    textArea.style.position = "fixed"; 
     textArea.style.left = "-9999px";
     textArea.style.top = "0";
     document.body.appendChild(textArea);
@@ -388,25 +379,12 @@ export default function App() {
     document.body.removeChild(textArea);
   };
 
-  // --- UI Components ---
-
-  const Header = () => (
-    <div className="bg-indigo-600 text-white p-4 shadow-md flex justify-between items-center z-10 relative">
-      <div className="flex items-center gap-2" onClick={() => setView('home')}>
-        <Wifi className="w-6 h-6 cursor-pointer" />
-        <h1 className="text-xl font-bold cursor-pointer">BridgeLink</h1>
-      </div>
-      <div className="text-xs bg-indigo-700 px-2 py-1 rounded">
-        {connectionStatus === 'connected' ? 'P2P 已加密连接' : '等待连接...'}
-      </div>
-    </div>
-  );
-
   if (!user) return <div className="h-screen flex items-center justify-center"><Loader className="animate-spin text-indigo-600 w-10 h-10" /></div>;
 
   return (
     <div className="min-h-screen bg-slate-50 font-sans text-slate-800 flex flex-col">
-      <Header />
+      {/* 这里的 Header 现在是外部组件，React 渲染更稳定 */}
+      <Header connectionStatus={connectionStatus} setView={setView} />
 
       <main className="flex-grow p-4 max-w-lg mx-auto w-full relative">
         {/* VIEW: HOME */}
@@ -441,14 +419,6 @@ export default function App() {
                 <span className="font-semibold">加入连接</span>
                 <span className="text-xs text-slate-400 mt-1">我有连接码</span>
               </button>
-            </div>
-            
-            <div className="bg-blue-50 p-4 rounded-lg text-xs text-blue-700 flex gap-2">
-              <div className="min-w-fit mt-0.5"><LinkIcon size={14} /></div>
-              <div>
-                <span className="font-bold">原理说明：</span> 
-                我们使用 Firebase 进行握手，然后使用 WebRTC 穿透 NAT。只要您的 192.168.1.x 和 192.168.2.x 设备都能访问外网，即可成功连接。
-              </div>
             </div>
           </div>
         )}
@@ -486,14 +456,12 @@ export default function App() {
         {view === 'session' && (
           <div className="flex flex-col h-[calc(100vh-120px)]">
             
-            {/* Connection Info */}
             <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 mb-4 flex justify-between items-center relative">
               <div>
                 <p className="text-xs text-slate-400 uppercase font-bold">当前房间</p>
                 <p className="text-2xl font-mono font-bold tracking-wider text-slate-800">{roomId}</p>
               </div>
               <div className="flex items-center gap-2">
-                 {/* Status Indicator */}
                  {connectionStatus === 'connected' ? (
                    <span className="hidden sm:flex items-center gap-1 text-emerald-600 text-sm font-medium bg-emerald-50 px-2 py-1 rounded">
                      <CheckCircle size={14} /> 已连接
@@ -504,7 +472,6 @@ export default function App() {
                    </span>
                  )}
                  
-                 {/* QR Toggle Button */}
                  <button 
                   onClick={() => setShowQR(!showQR)} 
                   className={`p-2 rounded-full transition-colors ${showQR ? 'bg-indigo-100 text-indigo-600' : 'bg-slate-100 hover:bg-slate-200'}`}
@@ -513,13 +480,11 @@ export default function App() {
                    <QrCode size={18} />
                  </button>
 
-                 {/* Copy Button */}
                  <button onClick={() => copyToClipboard(roomId)} className="p-2 bg-slate-100 rounded-full hover:bg-slate-200" title="复制房间号">
                    <Copy size={18} />
                  </button>
               </div>
 
-              {/* QR Code Popup */}
               {showQR && (
                 <div className="absolute top-full left-0 right-0 mt-2 z-20 flex flex-col items-center bg-white p-4 rounded-xl shadow-xl border border-slate-200 animate-in fade-in zoom-in duration-200">
                   <div className="bg-white p-2 rounded-lg">
@@ -551,7 +516,6 @@ export default function App() {
               )}
             </div>
 
-            {/* Chat/Log Area */}
             <div className="flex-grow bg-slate-100 rounded-xl mb-4 p-4 overflow-y-auto space-y-3 shadow-inner">
               {messages.length === 0 && (
                 <div className="text-center text-slate-400 mt-10">
@@ -573,7 +537,6 @@ export default function App() {
               ))}
             </div>
 
-            {/* File Transfer Area */}
             {transferProgress > 0 && (
                <div className="mb-4 bg-white p-3 rounded-lg shadow-sm border border-slate-200">
                  <div className="flex justify-between text-xs mb-1">
@@ -589,7 +552,6 @@ export default function App() {
                </div>
             )}
 
-            {/* Files List */}
             {files.length > 0 && (
               <div className="mb-4 space-y-2 max-h-32 overflow-y-auto">
                  {files.map((file, i) => (
@@ -613,7 +575,6 @@ export default function App() {
               </div>
             )}
 
-            {/* Controls */}
             <div className="flex gap-2">
               <label className={`p-3 rounded-lg flex items-center justify-center cursor-pointer transition-colors ${connectionStatus !== 'connected' || isSending ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-slate-800 text-white hover:bg-slate-700'}`}>
                 <FileText size={20} />
