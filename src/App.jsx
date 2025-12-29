@@ -80,6 +80,7 @@ export default function App() {
   const currentFileMeta = useRef(null);
   const processedCandidates = useRef(new Set()); 
   const heartbeatInterval = useRef(null); // 用于保持 NAT 连接的心跳定时器
+  const isSettingRemoteAnswer = useRef(false); // 防止重复设置 Answer 导致报错
 
   // --- Auth & URL Params ---
   useEffect(() => {
@@ -119,6 +120,7 @@ export default function App() {
       
     peerConnection.current = new RTCPeerConnection(rtcConfig);
     processedCandidates.current.clear();
+    isSettingRemoteAnswer.current = false;
 
     peerConnection.current.onicecandidate = async (event) => {
       if (event.candidate && auth.currentUser) {
@@ -141,8 +143,8 @@ export default function App() {
         setShowQR(false); 
       } else if (peerConnection.current.connectionState === 'disconnected' || peerConnection.current.connectionState === 'failed') {
         setConnectionStatus('disconnected');
-        // 关键修复：移除 alert 弹窗，防止阻塞 JS 线程导致无法自动重连
-        // 仅在 UI 上显示断开，允许底层 WebRTC 尝试恢复
+        // 关键修复：移除 alert 弹窗，改为系统消息，防止阻塞
+        addSystemMessage("连接已断开");
         if (heartbeatInterval.current) clearInterval(heartbeatInterval.current);
       }
     };
@@ -260,13 +262,21 @@ export default function App() {
 
     await setupPeerConnection(true, generatedId);
 
-    onSnapshot(roomRef, (snapshot) => {
+    onSnapshot(roomRef, async (snapshot) => {
       const data = snapshot.data();
       if (!data) return;
 
-      if (!peerConnection.current.currentRemoteDescription && data.answer) {
-        const answer = new RTCSessionDescription(data.answer);
-        peerConnection.current.setRemoteDescription(answer);
+      // 修复 InvalidStateError: 只有在等待应答时才设置 Answer，且防止重复设置
+      if (peerConnection.current.signalingState === 'have-local-offer' && data.answer && !isSettingRemoteAnswer.current) {
+        isSettingRemoteAnswer.current = true;
+        try {
+          const answer = new RTCSessionDescription(data.answer);
+          await peerConnection.current.setRemoteDescription(answer);
+        } catch (e) {
+          console.error("Error setting remote answer:", e);
+        } finally {
+          isSettingRemoteAnswer.current = false;
+        }
       }
 
       if (data.calleeCandidates && Array.isArray(data.calleeCandidates)) {
@@ -345,6 +355,13 @@ export default function App() {
 
     reader.onload = async (e) => {
       if (!dataChannel.current) return;
+
+      // 修复传输卡死：添加背压控制 (Backpressure Check)
+      // 如果缓冲区积压超过 64KB，暂停读取，等待缓冲区清空
+      while (dataChannel.current.bufferedAmount > 64 * 1024) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+
       dataChannel.current.send(e.target.result);
       offset += e.target.result.byteLength;
 
