@@ -18,7 +18,7 @@ import {
 // --- Firebase Configuration & Initialization ---
 // ⚠️ 必须修改：请替换为你自己的 Firebase 项目配置
 const firebaseConfig = {
-  apiKey: "AIzaSyD4CjObcCBweNd_iV5zXO9WHUCYqgFhyJk",
+   apiKey: "AIzaSyD4CjObcCBweNd_iV5zXO9WHUCYqgFhyJk",
   authDomain: "bridgelink-4c01a.firebaseapp.com",
   projectId: "bridgelink-4c01a",
   storageBucket: "bridgelink-4c01a.firebasestorage.app",
@@ -106,7 +106,6 @@ export default function App() {
   // --- WebRTC Logic ---
 
   const setupPeerConnection = async (isInitiator, activeRoomId) => {
-    // 每次新建连接前先清理旧的，防止内存泄漏或状态冲突
     if (peerConnection.current) {
         peerConnection.current.close();
     }
@@ -135,9 +134,8 @@ export default function App() {
         setShowQR(false); 
       } else if (peerConnection.current.connectionState === 'disconnected' || peerConnection.current.connectionState === 'failed') {
         setConnectionStatus('disconnected');
-        // 不要立即重置视图，给用户一点反应时间，或者允许重连
-        alert("连接已断开");
-        // setView('home'); 
+        // 使用 setTimeout 防止阻塞渲染导致崩溃
+        setTimeout(() => alert("连接已断开"), 100);
       }
     };
 
@@ -383,7 +381,6 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 font-sans text-slate-800 flex flex-col">
-      {/* 这里的 Header 现在是外部组件，React 渲染更稳定 */}
       <Header connectionStatus={connectionStatus} setView={setView} />
 
       <main className="flex-grow p-4 max-w-lg mx-auto w-full relative">
@@ -462,15 +459,11 @@ export default function App() {
                 <p className="text-2xl font-mono font-bold tracking-wider text-slate-800">{roomId}</p>
               </div>
               <div className="flex items-center gap-2">
-                 {connectionStatus === 'connected' ? (
-                   <span className="hidden sm:flex items-center gap-1 text-emerald-600 text-sm font-medium bg-emerald-50 px-2 py-1 rounded">
-                     <CheckCircle size={14} /> 已连接
-                   </span>
-                 ) : (
-                   <span className="hidden sm:flex items-center gap-1 text-amber-600 text-sm font-medium bg-amber-50 px-2 py-1 rounded">
-                     <Loader size={14} className="animate-spin" /> 连接中...
-                   </span>
-                 )}
+                 {/* 优化状态指示器渲染，合并 className，修复编译错误 */}
+                 <div className={`flex items-center gap-1 text-sm font-medium px-2 py-1 rounded transition-colors duration-300 ${connectionStatus === 'connected' ? "bg-emerald-50 text-emerald-600" : "bg-amber-50 text-amber-600"}`}>
+                    {connectionStatus === 'connected' ? <CheckCircle size={14} /> : <Loader size={14} className="animate-spin" />}
+                    <span className="hidden sm:inline">{connectionStatus === 'connected' ? '已连接' : '连接中...'}</span>
+                 </div>
                  
                  <button 
                   onClick={() => setShowQR(!showQR)} 
@@ -485,8 +478,8 @@ export default function App() {
                  </button>
               </div>
 
-              {showQR && (
-                <div className="absolute top-full left-0 right-0 mt-2 z-20 flex flex-col items-center bg-white p-4 rounded-xl shadow-xl border border-slate-200 animate-in fade-in zoom-in duration-200">
+              {/* 使用 CSS 隐藏而不是 React 条件渲染，防止 DOM 节点丢失导致的崩溃 */}
+              <div className={`absolute top-full left-0 right-0 mt-2 z-20 flex flex-col items-center bg-white p-4 rounded-xl shadow-xl border border-slate-200 transition-all duration-300 origin-top ${showQR ? 'opacity-100 scale-100 visible' : 'opacity-0 scale-95 invisible pointer-events-none'}`}>
                   <div className="bg-white p-2 rounded-lg">
                     <img 
                       src={`https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(getJoinUrl())}`} 
@@ -512,8 +505,7 @@ export default function App() {
                        关闭
                      </button>
                   </div>
-                </div>
-              )}
+              </div>
             </div>
 
             <div className="flex-grow bg-slate-100 rounded-xl mb-4 p-4 overflow-y-auto space-y-3 shadow-inner">
