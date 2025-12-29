@@ -16,18 +16,20 @@ import {
  */
 
 // --- Firebase Configuration & Initialization ---
-//const firebaseConfig = JSON.parse(__firebase_config);
-//const appId = typeof __app_id !== 'undefined' ? __app_id : 'bridge-link';
+// ⚠️ 必须修改：请替换为你自己的 Firebase 项目配置
+// 你可以在 Firebase Console -> Project Settings -> General -> Your apps 中找到
 const firebaseConfig = {
-  apiKey: "AIzaSyD4CjObcCBweNd_iV5zXO9WHUCYqgFhyJk",
+   apiKey: "AIzaSyD4CjObcCBweNd_iV5zXO9WHUCYqgFhyJk",
   authDomain: "bridgelink-4c01a.firebaseapp.com",
   projectId: "bridgelink-4c01a",
   storageBucket: "bridgelink-4c01a.firebasestorage.app",
   messagingSenderId: "148504358430",
-  appId: "1:148504358430:web:6e836f1ef867bd3e57480f",
-  measurementId: "G-30GSZLH52F"
+  appId: "1:148504358430:web:6e836f1ef867bd3e57480f"
 };
+
+// 你可以自定义应用ID，用于区分数据库中的数据路径
 const appId = 'bridge-link-v1';
+
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
@@ -67,12 +69,8 @@ export default function App() {
   useEffect(() => {
     const initAuth = async () => {
       try {
-        // CORRECT AUTH FLOW: Use custom token if available, otherwise anonymous
-        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-          await signInWithCustomToken(auth, __initial_auth_token);
-        } else {
-          await signInAnonymously(auth);
-        }
+        // 在真实部署环境中，通常直接使用匿名登录即可
+        await signInAnonymously(auth);
       } catch (error) {
         console.error("Auth Error:", error);
       }
