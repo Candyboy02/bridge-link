@@ -79,6 +79,7 @@ export default function App() {
   const receivedSize = useRef(0);
   const currentFileMeta = useRef(null);
   const processedCandidates = useRef(new Set()); 
+  const heartbeatInterval = useRef(null); // 用于保持 NAT 连接的心跳定时器
 
   // --- Auth & URL Params ---
   useEffect(() => {
@@ -100,7 +101,10 @@ export default function App() {
       setView('join');
     }
 
-    return () => unsubscribe();
+    return () => {
+      unsubscribe();
+      if (heartbeatInterval.current) clearInterval(heartbeatInterval.current);
+    };
   }, []);
 
   // --- WebRTC Logic ---
@@ -108,6 +112,9 @@ export default function App() {
   const setupPeerConnection = async (isInitiator, activeRoomId) => {
     if (peerConnection.current) {
         peerConnection.current.close();
+    }
+    if (heartbeatInterval.current) {
+        clearInterval(heartbeatInterval.current);
     }
       
     peerConnection.current = new RTCPeerConnection(rtcConfig);
@@ -134,8 +141,9 @@ export default function App() {
         setShowQR(false); 
       } else if (peerConnection.current.connectionState === 'disconnected' || peerConnection.current.connectionState === 'failed') {
         setConnectionStatus('disconnected');
-        // 使用 setTimeout 防止阻塞渲染导致崩溃
-        setTimeout(() => alert("连接已断开"), 100);
+        // 关键修复：移除 alert 弹窗，防止阻塞 JS 线程导致无法自动重连
+        // 仅在 UI 上显示断开，允许底层 WebRTC 尝试恢复
+        if (heartbeatInterval.current) clearInterval(heartbeatInterval.current);
       }
     };
 
@@ -165,6 +173,23 @@ export default function App() {
       setConnectionStatus('connected');
       addSystemMessage("P2P 通道已建立！可以开始传输。");
       setShowQR(false); 
+
+      // 关键修复：启动心跳机制，每2秒发送一次 ping，防止移动端 NAT 关闭端口
+      if (heartbeatInterval.current) clearInterval(heartbeatInterval.current);
+      heartbeatInterval.current = setInterval(() => {
+        if (dataChannel.current && dataChannel.current.readyState === 'open') {
+          try {
+             dataChannel.current.send(JSON.stringify({ type: 'ping' }));
+          } catch (e) {
+             console.error("Heartbeat failed", e);
+          }
+        }
+      }, 2000);
+    };
+
+    dataChannel.current.onclose = () => {
+        if (heartbeatInterval.current) clearInterval(heartbeatInterval.current);
+        setConnectionStatus('disconnected');
     };
 
     dataChannel.current.onmessage = handleDataChannelMessage;
@@ -173,17 +198,23 @@ export default function App() {
   const handleDataChannelMessage = (event) => {
     const data = event.data;
     if (typeof data === 'string') {
-      const msg = JSON.parse(data);
-      if (msg.type === 'text') {
-        setMessages(prev => [...prev, { sender: 'peer', text: msg.content, time: new Date() }]);
-      } else if (msg.type === 'file-meta') {
-        currentFileMeta.current = msg;
-        receivedBuffers.current = [];
-        receivedSize.current = 0;
-        setTransferProgress(0);
-        addSystemMessage(`正在接收文件: ${msg.name} (${formatBytes(msg.size)})...`);
-      } else if (msg.type === 'file-end') {
-        saveReceivedFile();
+      try {
+        const msg = JSON.parse(data);
+        if (msg.type === 'ping') return; // 忽略心跳包
+
+        if (msg.type === 'text') {
+          setMessages(prev => [...prev, { sender: 'peer', text: msg.content, time: new Date() }]);
+        } else if (msg.type === 'file-meta') {
+          currentFileMeta.current = msg;
+          receivedBuffers.current = [];
+          receivedSize.current = 0;
+          setTransferProgress(0);
+          addSystemMessage(`正在接收文件: ${msg.name} (${formatBytes(msg.size)})...`);
+        } else if (msg.type === 'file-end') {
+          saveReceivedFile();
+        }
+      } catch (e) {
+        console.error("Failed to parse message", e);
       }
     } else {
       receivedBuffers.current.push(data);
